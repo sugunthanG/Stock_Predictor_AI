@@ -1,94 +1,79 @@
+# backend/app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import yfinance as yf
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-import numpy as np
-import requests
+from model.explain_model import train_and_predict
+from utils.aggregator import aggregate_stock_data
+import traceback
 
 app = Flask(__name__)
-CORS(app)  # Allow cross-origin for React
+CORS(app)
 
-# Fetch last 20 days price data
-def get_stock_data(symbol):
-    stock = yf.download(symbol, period="1mo", interval="1h")
-    if stock.empty:
-        return None
-    stock['Return'] = stock['Close'].pct_change()
-    stock.dropna(inplace=True)
-    return stock
-
-# Predict next day trend
-def predict_stock(stock):
-    X = stock[['Return']]
-    y = np.where(stock['Return'].shift(-1) > 0, 1, 0)
-    X.dropna(inplace=True)
-    y = y[-len(X):]  # align length
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = LogisticRegression(max_iter=500)
-    model.fit(X_scaled, y)
-    
-    latest_return = np.array([[X['Return'].iloc[-1]]])
-    latest_scaled = scaler.transform(latest_return)
-    pred = model.predict(latest_scaled)[0]
-    return "UP 📈" if pred == 1 else "DOWN 📉"
-
-# Fetch news (optional, requires NewsAPI key)
-def get_stock_news(symbol):
-    API_KEY = "bb28616d58144571ab9745e56e9cc708"  # Replace with your key or leave empty
-    if not API_KEY:
-        return ["News API not configured."]
-    url = f"https://newsapi.org/v2/everything?q={symbol}&sortBy=publishedAt&language=en&apiKey={API_KEY}"
-    try:
-        res = requests.get(url)
-        res.raise_for_status()
-        data = res.json()
-        articles = data.get('articles', [])
-        return [f"{a['title']} ({a['publishedAt'][:10]})" for a in articles[:10]]
-    except:
-        return ["Failed to fetch news."]
-
-# Suggestion based on prediction
-def get_suggestion(prediction):
-    return "You can buy this stock ✅" if prediction == "UP 📈" else "Not recommended to buy ❌"
 
 @app.route('/')
 def home():
-    return "✅ Flask backend is running!"
+    return jsonify({"message": "✅ SMARTFIN Backend Running Successfully!"})
+
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    print("🔹 /predict route hit")
+
     try:
         data = request.get_json()
-        symbol = data.get('symbol')
-        if not symbol:
-            return jsonify({"error": "Please provide a stock symbol"}), 400
+        print("📩 Received data:", data)
 
-        stock = get_stock_data(symbol)
-        if stock is None:
-            return jsonify({"error": f"No data found for {symbol}"}), 404
+        if not data or "symbol" not in data:
+            return jsonify({"error": "Please provide a valid stock symbol"}), 400
 
-        prediction = predict_stock(stock)
-        news = get_stock_news(symbol)
-        suggestion = get_suggestion(prediction)
+        symbol = data["symbol"].strip().upper()
 
-        last_10_days = stock['Close'][-10:].round(2).to_dict()
-        today_trend = [{"time": str(t), "close": c} for t, c in zip(stock.index[-8:], stock['Close'][-8:])]
+        # Aggregate data
+        print(f"📊 Aggregating data for symbol: {symbol}")
+        stock_df, news_data = aggregate_stock_data(symbol)
 
-        return jsonify({
+        if stock_df is None or stock_df.empty:
+            print(f"⚠️ No stock data found for {symbol}")
+            return jsonify({"error": f"No valid data found for {symbol}"}), 404
+
+        # Run model
+        print(f"🧠 Running model for {symbol}")
+        prediction_result = train_and_predict(stock_df)
+
+        if not prediction_result or "prediction" not in prediction_result:
+            print("⚠️ Prediction result missing expected fields")
+            return jsonify({"error": "Model failed to generate prediction"}), 500
+
+        print("✅ Prediction result generated successfully:", prediction_result)
+
+        # Build response
+        # Ensure index is JSON-serializable (string)
+        last_10 = stock_df["Close"].tail(10).round(2)
+        last_10_dict = {str(idx): float(val) for idx, val in last_10.items()}
+
+        today_trend_idx = stock_df.index[-8:]
+        today_trend_vals = stock_df["Close"].tail(8).astype(float).tolist()
+        today_trend = [{"time": str(t), "close": float(c)} for t, c in zip(today_trend_idx, today_trend_vals)]
+
+        response = {
             "symbol": symbol,
-            "last_10_days": last_10_days,
-            "news": news,
+            "last_10_days": last_10_dict,
             "today_trend": today_trend,
-            "tomorrow_prediction": prediction,
-            "suggestion": suggestion
-        })
+            "tomorrow_prediction": prediction_result.get("prediction", "N/A"),
+            "explanation": prediction_result.get("explanation", {}),
+            "suggestion": prediction_result.get("suggestion", "N/A"),
+            "news": news_data if news_data else [],
+            "feature_importance": prediction_result.get("feature_importance", {}),
+            "raw_prediction_value": prediction_result.get("raw_prediction_value")
+        }
+
+        return jsonify(response), 200
 
     except Exception as e:
-        import traceback
+        print("❌ Error in /predict route:")
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+
+if __name__ == "__main__":
+    print("🚀 Starting SMARTFIN Flask backend on http://127.0.0.1:5000")
+    app.run(debug=True, host="0.0.0.0", port=5000)
